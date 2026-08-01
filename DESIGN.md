@@ -1,35 +1,36 @@
 # Starbeam Design
 
-![Starbeam](assets/starbeam-logo.svg)
+![Starbeam](assets/starbeam-logo.png?v=3)
 
-Starbeam is a lean Datastar SDK for Clojerl applications served by Cowboy. Its core responsibility is narrow: read Datastar signals from Cowboy requests and write ADR-compliant Datastar events to Cowboy streaming responses.
+Starbeam reads Datastar signals from Cowboy requests and writes Datastar events to Cowboy streaming responses.
 
 ## Goals
 
-- Fully implement the Datastar SDK ADR.
-- Use Cowboy directly, without a generic HTTP abstraction.
-- Preserve BEAM-native process ownership and failure behavior.
-- Stream iodata without flattening complete responses into copied binaries.
-- Remain small enough to understand as a single subsystem.
-- Support long-lived query streams, full-view morphs, and command/query separation without embedding an application framework.
+- Implement the Datastar SDK event contract.
+- Use Cowboy without another HTTP abstraction.
+- Preserve BEAM process ownership and failure behavior.
+- Build streamed responses as iodata.
+- Keep routing, rendering, persistence, and application lifecycle outside the SDK.
+- Support long-lived query streams and command/query separation.
 
 ## Non-goals
 
-Starbeam does not provide routing, middleware, persistence, pub/sub, HTML templating, browser attributes, application lifecycle, authentication, or a CQRS framework. Applications compose those concerns around the SDK.
+Starbeam excludes routing, middleware, persistence, pub/sub, HTML templating, browser attributes, application lifecycle, authentication, and CQRS orchestration.
 
 ## Platform
 
-Initial target:
+Supported versions:
 
 - Clojerl 0.9.1
-- Erlang/OTP 27 or newer
+- Erlang/OTP 27 or 28
 - Cowboy 2.13
+- Datastar 1.0.2
 
-OTP provides JSON encoding and decoding. Cowboy provides request parsing, response headers, and streamed response bodies. HTML renderers remain optional application dependencies.
+OTP handles JSON. Cowboy handles requests and streamed responses. Applications choose their HTML renderer.
 
 ## Public API
 
-The initial namespace is `starbeam.core`.
+The public API lives in `starbeam.core`.
 
 ```clojure
 (open! request)
@@ -44,9 +45,9 @@ The initial namespace is `starbeam.core`.
 (close! stream)
 ```
 
-`open!` starts the Cowboy streaming response and returns an opaque stream handle. `request` exposes the updated Cowboy request that a handler must return to Cowboy. Event operations return `:ok` or propagate an Erlang/Clojerl error. `close!` finishes the response body.
+`open!` starts a Cowboy streaming response and returns an opaque handle. `request` returns the updated Cowboy request for the handler response. Event operations return `:ok` or propagate the underlying error. `close!` finishes the body.
 
-`read-signals` returns `[signals updated-request]`. Cowboy request values are immutable, and body reads return a new request value that subsequent response operations must use.
+`read-signals` returns `[signals updated-request]`. Use the returned request after every body read.
 
 ## Stream handle
 
@@ -56,7 +57,7 @@ A stream handle contains:
 - PID that opened the stream
 - Open/closed state where required by Cowboy interaction
 
-Only the owner process may write. This process-confinement rule provides deterministic event ordering without locks. Other processes notify the owner through normal BEAM messages.
+Only the owner process may write. Other processes send BEAM messages to the owner. This preserves event order without locks.
 
 ## Response initialization
 
@@ -73,11 +74,11 @@ For HTTP/1.1 only:
 Connection: keep-alive
 ```
 
-Cowboy's streamed reply starts the response immediately. Starbeam does not add buffering, compression, proxy, or cache-vendor headers.
+Cowboy starts the response immediately. Starbeam adds no buffering, compression, proxy, or vendor-specific cache headers.
 
 ## Event framing
 
-A private event writer builds one iodata frame and sends it with one Cowboy `stream_body` operation.
+The event writer builds one iodata frame and sends it with one Cowboy `stream_body` operation.
 
 Frame order is fixed:
 
@@ -87,7 +88,7 @@ Frame order is fixed:
 4. one `data` field per payload line
 5. blank line terminating the event
 
-The default retry duration is 1000 milliseconds and is omitted from the wire. Building and sending a complete frame in one operation prevents byte-level interleaving.
+The default retry duration is 1000 milliseconds and stays off the wire. One send per frame prevents byte-level interleaving.
 
 ## Element patches
 
@@ -122,11 +123,11 @@ Namespaces:
 - `:svg`
 - `:mathml`
 
-Default-valued options are omitted. `elements` may be a binary or iodata. Every supplied top-level item must be a complete element. Starbeam does not parse or validate HTML.
+Default values stay off the wire. `elements` accepts binaries and iodata. Each top-level item must contain a complete element. Starbeam does not parse HTML.
 
 ## Signal patches
 
-`patch-signals!` emits `datastar-patch-signals` using RFC 7386 JSON Merge Patch semantics.
+`patch-signals!` emits `datastar-patch-signals` with RFC 7386 JSON Merge Patch semantics.
 
 Options:
 
@@ -136,11 +137,11 @@ Options:
  :retry-duration 2000}
 ```
 
-The function accepts pre-encoded JSON or an Erlang JSON term supported by OTP's JSON encoder. Pre-encoded input is sent without key conversion or structural rewriting.
+The function accepts pre-encoded JSON or an Erlang JSON term. Pre-encoded input passes through unchanged.
 
 ## Script execution
 
-`execute-script!` creates a script element and sends it as an element patch with:
+`execute-script!` sends a script element as an element patch:
 
 ```text
 mode append
@@ -156,7 +157,7 @@ Options:
  :retry-duration 2000}
 ```
 
-Automatic removal adds `data-effect="el.remove()"`. Script content is developer-authored code; Starbeam does not evaluate or interpolate it.
+Automatic removal adds `data-effect="el.remove()"`. Starbeam sends script content unchanged and never evaluates it.
 
 ## Reading signals
 
@@ -170,13 +171,13 @@ Signal location depends on method:
 | PUT | JSON request body |
 | PATCH | JSON request body |
 
-Body reads continue until Cowboy returns the final chunk. Malformed JSON, missing signal data, unsupported methods, and body read failures produce descriptive exceptions.
+Body reads continue through Cowboy's final chunk. Malformed JSON, missing signals, unsupported methods, and read failures raise exceptions.
 
-Decoded JSON remains in Erlang-native form: maps with binary keys, lists, binaries, numbers, booleans, and the JSON null atom. Automatic conversion to a second collection representation would duplicate the decoded object graph.
+Decoded JSON remains an Erlang term. Converting it to another collection type would copy the object graph.
 
-## CQRS and fat morph support
+## CQRS integration
 
-Starbeam stays transport-focused but permits this application flow:
+One application pattern:
 
 ```text
 command request
@@ -194,9 +195,9 @@ subscription request
   -> repeat
 ```
 
-A subscription sends current state immediately after connecting. Notifications indicate that state may have changed; they are not treated as UI deltas. Reconnection therefore needs only a fresh render, not event replay.
+Subscriptions send current state on connection. Notifications trigger another read; they carry no UI delta. Reconnection renders current state without event replay.
 
-Applications may coalesce repeated notifications before re-reading state. Shared immutable rendered binaries may be reused across connections when users share the same view. Neither behavior belongs in SDK core.
+Applications may coalesce notifications or reuse immutable rendered binaries across equivalent connections. The SDK implements neither policy.
 
 ## Performance model
 
@@ -209,13 +210,13 @@ Applications may coalesce repeated notifications before re-reading state. Shared
 
 ## Verification
 
-Verification has three layers:
+Tests start a real Cowboy listener and cover:
 
-1. Pure event tests compare exact bytes for defaults, all options, multiline payloads, scripts, and invalid values.
-2. Cowboy integration tests verify headers, body streaming, all signal-bearing methods, chunked bodies, closure, and disconnect behavior.
-3. Datastar's external SDK conformance runner exercises the public `/test` endpoint over real HTTP.
-
-A CQRS example provides an end-to-end smoke scenario with two subscribers, a command returning 204, a full-view update, and reconnect recovery.
+- exact event bytes and response headers
+- signal decoding for `GET`, `DELETE`, `POST`, `PUT`, and `PATCH`
+- stream ownership, closure, and payload limits
+- concurrent CQRS subscribers and reconnect-safe full morphs
+- middleware cookie preservation
 
 ## References
 
