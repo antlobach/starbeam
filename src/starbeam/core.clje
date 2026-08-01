@@ -1,0 +1,345 @@
+(ns starbeam.core
+  (:require [clojure.string :as string]))
+
+(def ^:private event-patch-elements "datastar-patch-elements")
+(def ^:private event-patch-signals "datastar-patch-signals")
+(def ^:private default-retry-duration 1000)
+(def ^:private default-mode "outer")
+(def ^:private default-namespace "html")
+(def ^:private valid-modes
+  #{"outer" "inner" "replace" "prepend" "append" "before" "after" "remove"})
+(def ^:private valid-namespaces #{"html" "svg" "mathml"})
+(def ^:private stream-open :starbeam/open)
+(def ^:private global-option
+  (#erl erlang/tuple_to_list #erl[:global]))
+
+(defn- fail! [message data]
+  (throw (ex-info message data)))
+
+(defn- single-line! [label value]
+  (when (or (string/includes? value "\r")
+            (string/includes? value "\n"))
+    (fail! (str label " cannot contain a line break.")
+           {:value value}))
+  value)
+
+(defn- enum-name [label value allowed]
+  (let [value (cond
+                (keyword? value) (name value)
+                (string? value) value
+                :else (fail! (str label " must be a keyword or string.")
+                             {:option label :value value}))]
+    (when-not (contains? allowed value)
+      (fail! (str "Unsupported " label ".")
+             {:option label :value value :allowed allowed}))
+    value))
+
+(defn- as-binary [value]
+  (cond
+    (string? value) value
+    (nil? value) (fail! "Payload cannot be nil." {:value value})
+    :else
+    (try
+      (#erl erlang/iolist_to_binary value)
+      (catch kind reason
+        (fail! "Payload must be a binary or valid iodata."
+               {:kind kind :reason reason})))))
+
+(defn- payload-lines [prefix payload]
+  (let [payload (-> (as-binary payload)
+                    (string/replace "\r\n" "\n")
+                    (string/replace "\r" "\n"))]
+    (if (= "" payload)
+      []
+      (mapv #(str prefix " " %)
+            (#erl binary/split payload "\n" global-option)))))
+
+(defn- event-frame [event-type data-lines options]
+  (let [event-id (:event-id options)
+        retry-duration (get options :retry-duration default-retry-duration)]
+    (when (and event-id (not (string? event-id)))
+      (fail! "Event ID must be a string."
+             {:option :event-id :value event-id}))
+    (when event-id
+      (single-line! "Event ID" event-id))
+    (when-not (and (integer? retry-duration) (not (neg? retry-duration)))
+      (fail! "Retry duration must be a non-negative integer."
+             {:option :retry-duration :value retry-duration}))
+    (let [lines (cond-> [(str "event: " event-type "\n")]
+                  event-id
+                  (conj (str "id: " event-id "\n"))
+
+                  (not= retry-duration default-retry-duration)
+                  (conj (str "retry: " retry-duration "\n")))
+          lines (into lines (map #(str "data: " % "\n") data-lines))]
+      (clj_rt/to_list.1 (conj lines "\n")))))
+
+(defn- option-lines [options]
+  (let [selector (:selector options)
+        mode (enum-name "element patch mode"
+                        (get options :mode default-mode)
+                        valid-modes)
+        use-view-transition? (get options :use-view-transition? false)
+        view-transition-selector (:view-transition-selector options)
+        namespace (enum-name "element namespace"
+                             (get options :namespace default-namespace)
+                             valid-namespaces)]
+    (when (and selector (not (string? selector)))
+      (fail! "Selector must be a string."
+             {:option :selector :value selector}))
+    (when selector
+      (single-line! "Selector" selector))
+    (when-not (or (true? use-view-transition?)
+                  (false? use-view-transition?))
+      (fail! "View transition option must be boolean."
+             {:option :use-view-transition?
+              :value use-view-transition?}))
+    (when (and view-transition-selector
+               (not (string? view-transition-selector)))
+      (fail! "View transition selector must be a string."
+             {:option :view-transition-selector
+              :value view-transition-selector}))
+    (when view-transition-selector
+      (single-line! "View transition selector"
+                    view-transition-selector))
+    (cond-> []
+      selector
+      (conj (str "selector " selector))
+
+      (not= mode default-mode)
+      (conj (str "mode " mode))
+
+      use-view-transition?
+      (conj "useViewTransition true")
+
+      (and use-view-transition? view-transition-selector)
+      (conj (str "viewTransitionSelector " view-transition-selector))
+
+      (not= namespace default-namespace)
+      (conj (str "namespace " namespace)))))
+
+(defn- patch-elements-frame [elements options]
+  (let [mode (enum-name "element patch mode"
+                        (get options :mode default-mode)
+                        valid-modes)
+        elements (when (some? elements) (as-binary elements))]
+    (when (and (nil? elements) (not= mode "remove"))
+      (fail! "Elements may be omitted only for remove mode."
+             {:mode mode}))
+    (when (and (= "" elements) (not= mode "remove"))
+      (fail! "Elements cannot be empty."
+             {:mode mode}))
+    (event-frame
+      event-patch-elements
+      (cond-> (option-lines options)
+        (some? elements)
+        (into (payload-lines "elements" elements)))
+      options)))
+
+(defn- json-binary [signals]
+  (if (string? signals)
+    signals
+    (try
+      (#erl erlang/iolist_to_binary (#erl json/encode signals))
+      (catch kind reason
+        (fail! "Signals must be JSON or an Erlang JSON term."
+               {:kind kind :reason reason})))))
+
+(defn- patch-signals-frame [signals options]
+  (when (nil? signals)
+    (fail! "Signals cannot be nil." {}))
+  (let [only-if-missing? (get options :only-if-missing? false)
+        signals (json-binary signals)]
+    (when-not (or (true? only-if-missing?) (false? only-if-missing?))
+      (fail! "Only-if-missing option must be boolean."
+             {:option :only-if-missing? :value only-if-missing?}))
+    (when (= "" signals)
+      (fail! "Signals cannot be empty." {}))
+    (event-frame
+      event-patch-signals
+      (cond-> []
+        only-if-missing?
+        (conj "onlyIfMissing true")
+
+        true
+        (into (payload-lines "signals" signals)))
+      options)))
+
+(defn- escape-attribute [value]
+  (-> (str value)
+      (string/replace "&" "&amp;")
+      (string/replace "\"" "&quot;")
+      (string/replace "<" "&lt;")
+      (string/replace ">" "&gt;")))
+
+(defn- attribute-name [value]
+  (cond
+    (keyword? value) (name value)
+    (string? value) value
+    :else (fail! "Script attribute names must be strings or keywords."
+                 {:attribute value})))
+
+(defn- attributes-text [attributes]
+  (apply str
+         (map (fn [[key value]]
+                (str " "
+                     (attribute-name key)
+                     "=\""
+                     (escape-attribute value)
+                     "\""))
+              attributes)))
+
+(defn- script-element [script options]
+  (when-not (string? script)
+    (fail! "Script must be a string." {:script script}))
+  (let [auto-remove? (get options :auto-remove? true)
+        attributes (or (:attributes options) {})]
+    (when-not (or (true? auto-remove?) (false? auto-remove?))
+      (fail! "Auto-remove option must be boolean."
+             {:option :auto-remove? :value auto-remove?}))
+    (when-not (map? attributes)
+      (fail! "Script attributes must be a map."
+             {:attributes attributes}))
+    (str "<script"
+         (attributes-text attributes)
+         (when auto-remove? " data-effect=\"el.remove()\"")
+         ">"
+         script
+         "</script>")))
+
+(defn- execute-script-frame [script options]
+  (patch-elements-frame
+    (script-element script options)
+    (assoc options :selector "body" :mode "append")))
+
+(defn- ensure-owner! [{:keys [owner]}]
+  (let [caller (#erl erlang/self)]
+    (when-not (= owner caller)
+      (fail! "Only the process that opened a stream may write to it."
+             {:owner owner :caller caller}))))
+
+(defn- ensure-open! [stream]
+  (ensure-owner! stream)
+  (when-not (= stream-open
+               (#erl erlang/get (:reference stream)))
+    (fail! "Stream is closed or invalid."
+           {:stream stream})))
+
+(defn- send-frame! [stream frame]
+  (ensure-open! stream)
+  (#erl cowboy_req/stream_body frame :nofin (:request stream)))
+
+(defn open!
+  "Starts a Datastar SSE response and returns its process-owned stream handle."
+  [request]
+  (let [headers (if (= :HTTP/1.1 (#erl cowboy_req/version request))
+                  #erl{"cache-control" "no-cache"
+                       "content-type" "text/event-stream"
+                       "connection" "keep-alive"}
+                  #erl{"cache-control" "no-cache"
+                       "content-type" "text/event-stream"})
+        request (#erl cowboy_req/stream_reply 200 headers request)
+        reference (#erl erlang/make_ref)]
+    (#erl erlang/put reference stream-open)
+    {:request request
+     :owner (#erl erlang/self)
+     :reference reference}))
+
+(defn request
+  "Returns the Cowboy request carrying this stream's response state."
+  [stream]
+  (:request stream))
+
+(defn patch-elements!
+  "Sends complete HTML elements for DOM patching."
+  ([stream elements]
+   (patch-elements! stream elements {}))
+  ([stream elements options]
+   (send-frame! stream (patch-elements-frame elements options))))
+
+(defn patch-signals!
+  "Sends an RFC 7386 JSON Merge Patch to the Datastar signal store."
+  ([stream signals]
+   (patch-signals! stream signals {}))
+  ([stream signals options]
+   (send-frame! stream (patch-signals-frame signals options))))
+
+(defn execute-script!
+  "Executes developer-authored JavaScript through an appended script element."
+  ([stream script]
+   (execute-script! stream script {}))
+  ([stream script options]
+   (send-frame! stream (execute-script-frame script options))))
+
+(defn close!
+  "Finishes a Datastar SSE response."
+  [stream]
+  (ensure-open! stream)
+  (#erl erlang/erase (:reference stream))
+  (#erl cowboy_req/stream_body "" :fin (:request stream)))
+
+(defn- decode-json [payload]
+  (try
+    (#erl json/decode (as-binary payload))
+    (catch kind reason
+      (fail! "Invalid Datastar signals JSON."
+             {:kind kind :reason reason}))))
+
+(defn- query-payload [request]
+  (let [entry (some (fn [pair]
+                      (when (= "datastar" (nth pair 0))
+                        pair))
+                    (#erl cowboy_req/parse_qs request))]
+    (when-not entry
+      (fail! "Missing datastar query parameter." {}))
+    [(nth entry 1) request]))
+
+(defn- body-payload [request options]
+  (let [max-length (#erl maps/get :length options 8000000)]
+    (when-not (and (integer? max-length) (pos? max-length))
+      (fail! "Cowboy body length must be a positive integer."
+             {:length max-length}))
+    (loop [request request
+           chunks []
+           length 0]
+      (let [result (#erl cowboy_req/read_body request options)
+            status (nth result 0)
+            chunk (nth result 1)
+            request (nth result 2)
+            length (+ length (#erl erlang/byte_size chunk))
+            chunks (conj chunks chunk)]
+        (when (> length max-length)
+          (fail! "Datastar signals payload is too large."
+                 {:length length :max-length max-length}))
+        (case status
+          :ok
+          [(#erl erlang/iolist_to_binary (clj_rt/to_list.1 chunks))
+           request]
+
+          :more
+          (if (= length max-length)
+            (fail! "Datastar signals payload is too large."
+                   {:length length :max-length max-length})
+            (recur request chunks length))
+
+          (fail! "Unexpected Cowboy body-read result."
+                 {:result result}))))))
+
+(defn read-signals
+  "Decodes Datastar signals and returns [signals updated-request].
+   The optional native Cowboy map configures read_body/2."
+  ([request]
+   (read-signals request #erl{}))
+  ([request body-options]
+   (when-not (#erl erlang/is_map body-options)
+     (fail! "Body read options must be an Erlang map."
+            {:body-options body-options}))
+   (let [method (#erl cowboy_req/method request)
+         [payload request]
+         (cond
+           (#{"GET" "DELETE"} method) (query-payload request)
+           (#{"POST" "PUT" "PATCH"} method)
+           (body-payload request body-options)
+           :else (fail! "Unsupported HTTP method for Datastar signals."
+                        {:method method}))]
+     [(decode-json payload) request])))

@@ -1,0 +1,142 @@
+(ns starbeam.live-clock
+  (:require [dev.onionpancakes.chassis.core :as chassis]
+            [starbeam.core :as starbeam]))
+
+(def ^:private listener :starbeam-clock)
+
+(defn- erl-tuple [values]
+  (#erl erlang/list_to_tuple (clj_rt/to_list.1 values)))
+
+(defn routes
+  "Returns route vectors accepted by `apply-routes!`."
+  []
+  [["/" :starbeam.live-clock nil]
+   ["/time" :starbeam.live-clock nil]])
+
+(defn- compile-dispatch [route-specs]
+  (let [handlers (clj_rt/to_list.1 (mapv erl-tuple route-specs))
+        host (erl-tuple [:_ handlers])]
+    (#erl cowboy_router/compile (clj_rt/to_list.1 [host]))))
+
+(defn apply-routes!
+  "Installs route vectors into the running Cowboy listener."
+  ([] (apply-routes! (routes)))
+  ([route-specs]
+   (#erl cowboy/set_env
+     listener
+     :dispatch
+     (compile-dispatch route-specs))))
+
+(defn- clock-value []
+  (let [date-time (#erl calendar/local_time)
+        time (nth date-time 1)
+        hour (nth time 0)
+        minute (nth time 1)
+        second (nth time 2)]
+    (#erl erlang/iolist_to_binary
+      (#erl io_lib/format "~2..0B:~2..0B:~2..0B"
+            (clj_rt/to_list.1 [hour minute second])))))
+
+(defn- date-value []
+  (let [date-time (#erl calendar/local_time)
+        date (nth date-time 0)
+        year (nth date 0)
+        month (nth date 1)
+        day (nth date 2)]
+    (#erl erlang/iolist_to_binary
+      (#erl io_lib/format "~4..0B-~2..0B-~2..0B"
+            (clj_rt/to_list.1 [year month day])))))
+
+(defn- clock-view []
+  (let [clock (clock-value)
+        date (date-value)]
+    [:main {:id "clock"
+            :class "relative z-10 flex min-h-screen items-center justify-center px-6 py-16"}
+     [:section {:class "w-full max-w-3xl overflow-hidden rounded-[2rem] border border-white/10 bg-slate-950/70 shadow-2xl shadow-cyan-950/40 backdrop-blur-xl"}
+      [:div {:class "flex items-center justify-between border-b border-white/10 px-7 py-5 sm:px-10"}
+       [:div {:class "flex items-center gap-3"}
+        [:span {:class "relative flex h-3 w-3"}
+         [:span {:class "absolute inline-flex h-full w-full animate-ping rounded-full bg-cyan-300 opacity-60"}]
+         [:span {:class "relative inline-flex h-3 w-3 rounded-full bg-cyan-300"}]]
+        [:span {:class "text-xs font-semibold tracking-[0.28em] text-cyan-100/80"}
+         "LIVE / BEAM"]]
+       [:span {:class "font-mono text-xs tracking-[0.2em] text-slate-500"}
+        date]]
+      [:div {:class "px-7 py-14 sm:px-10 sm:py-20"}
+       [:p {:class "mb-4 text-xs font-medium uppercase tracking-[0.42em] text-violet-300/80"}
+        "Local time"]
+       [:time {:datetime clock
+               :class "block font-mono text-[clamp(3.3rem,13vw,8.5rem)] font-semibold leading-none tracking-[-0.08em] text-white tabular-nums"}
+        clock]
+       [:div {:class "mt-10 flex items-center gap-4"}
+        [:span {:class "h-px flex-1 bg-gradient-to-r from-cyan-300/70 via-violet-400/40 to-transparent"}]
+        [:span {:class "font-mono text-[0.65rem] uppercase tracking-[0.28em] text-slate-500"}
+         "Starbeam / Datastar"]]]]]))
+
+(defn render-clock []
+  (chassis/html (clock-view)))
+
+(defn- render-page []
+  (chassis/html
+    [chassis/doctype-html5
+     [:html {:lang "en" :class "bg-[#050816]"}
+      [:head
+       [:meta {:charset "utf-8"}]
+       [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
+       [:title "Starbeam Live Clock"]
+       [:script {:src "https://cdn.tailwindcss.com"}]
+       [:script {:type "module"
+                 :src "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.2/bundles/datastar.js"}]
+       [:style "body { background-color: #050816; background-image: radial-gradient(circle at 20% 15%, rgba(34,211,238,.16), transparent 30rem), radial-gradient(circle at 80% 85%, rgba(139,92,246,.16), transparent 32rem); } body::before { content: ''; position: fixed; inset: 0; pointer-events: none; opacity: .18; background-image: linear-gradient(rgba(255,255,255,.08) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.08) 1px, transparent 1px); background-size: 48px 48px; mask-image: linear-gradient(to bottom, black, transparent); }"]]
+      [:body {:class "min-h-screen overflow-hidden antialiased"
+              :data-init "@get('/time')"}
+       (clock-view)]]]))
+
+(defn init [request state]
+  (case (#erl cowboy_req/path request)
+    "/"
+    (let [request (#erl cowboy_req/reply
+                          200
+                          #erl{"content-type" "text/html; charset=utf-8"}
+                          (render-page)
+                          request)]
+      #erl[:ok request state])
+
+    "/time"
+    (let [stream (starbeam/open! request)]
+      (starbeam/patch-elements! stream (render-clock))
+      (#erl erlang/send_after 1000 (#erl erlang/self) :tick)
+      #erl[:cowboy_loop (starbeam/request stream) stream])
+
+    (let [request (#erl cowboy_req/reply 404 #erl{} "Not found" request)]
+      #erl[:ok request state])))
+
+(defn info [message request stream]
+  (if (= :tick message)
+    (if (= :ok (starbeam/patch-elements! stream (render-clock)))
+      (do
+        (#erl erlang/send_after 1000 (#erl erlang/self) :tick)
+        #erl[:ok (starbeam/request stream) stream])
+      #erl[:stop request stream])
+    #erl[:ok request stream]))
+
+(defn terminate [_reason _request _state]
+  nil)
+
+(defn start!
+  ([] (start! 8080))
+  ([port]
+   (#erl application/ensure_all_started :cowboy)
+   (let [dispatch (compile-dispatch (routes))
+         socket-options (clj_rt/to_list.1 [#erl[:port port]])]
+     (#erl cowboy/start_clear
+       listener
+       #erl{:socket_opts socket-options}
+       #erl{:env #erl{:dispatch dispatch}}))))
+
+(defn stop! []
+  (#erl cowboy/stop_listener listener))
+
+(defn -main [& _args]
+  (start!)
+  (#erl timer/sleep :infinity))

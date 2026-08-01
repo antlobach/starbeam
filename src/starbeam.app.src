@@ -1,0 +1,6 @@
+{application, starbeam,
+ [{description, "Lean Datastar SDK for Clojerl and Cowboy"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications, [kernel, stdlib, clojerl, cowboy]},
+  {env, []}]}.

@@ -1,0 +1,354 @@
+(ns starbeam.core-test
+  (:require [clojure.string :as string]
+            [clojure.test :refer :all]
+            [starbeam.core :as starbeam]))
+
+(def ^:private listener :starbeam-test)
+(def ^:private empty-list
+  (#erl erlang/tuple_to_list #erl[]))
+(def ^:private binary-body-options
+  (#erl erlang/tuple_to_list #erl[#erl[:body_format :binary]]))
+(def ^:private json-content-type
+  (#erl erlang/binary_to_list "application/json"))
+(def ^:private subscribers (atom #{}))
+(def ^:private relay-value (atom 0))
+(def ^:private lifecycle-results (atom {}))
+(declare eventually?)
+
+(def ^:private expected-stream
+  (str
+    "event: datastar-patch-elements\n"
+    "id: view-1\n"
+    "retry: 2000\n"
+    "data: selector #app\n"
+    "data: mode inner\n"
+    "data: useViewTransition true\n"
+    "data: viewTransitionSelector #app\n"
+    "data: elements <main id=\"app\">Ready</main>\n"
+    "\n"
+    "event: datastar-patch-elements\n"
+    "data: elements <div>A\n"
+    "data: elements B\n"
+    "data: elements C</div>\n"
+    "\n"
+    "event: datastar-patch-signals\n"
+    "data: onlyIfMissing true\n"
+    "data: signals {\"ready\":true}\n"
+    "\n"
+    "event: datastar-patch-elements\n"
+    "data: selector body\n"
+    "data: mode append\n"
+    "data: elements <script type=\"application/javascript\" data-effect=\"el.remove()\">console.log('starbeam')</script>\n"
+    "\n"))
+
+(defn- stream-response [request state]
+  (let [stream (starbeam/open! request)]
+    (starbeam/patch-elements!
+      stream
+      "<main id=\"app\">Ready</main>"
+      {:selector "#app"
+       :mode :inner
+       :use-view-transition? true
+       :view-transition-selector "#app"
+       :event-id "view-1"
+       :retry-duration 2000})
+    (starbeam/patch-elements! stream "<div>A\r\nB\rC</div>")
+    (starbeam/patch-signals!
+      stream
+      "{\"ready\":true}"
+      {:only-if-missing? true})
+    (starbeam/execute-script!
+      stream
+      "console.log('starbeam')"
+      {:attributes {"type" "application/javascript"}})
+    (starbeam/close! stream)
+    #erl[:ok (starbeam/request stream) state]))
+
+(defn- signals-response [request state]
+  (let [[signals request] (starbeam/read-signals request)
+        body (#erl erlang/iolist_to_binary (#erl json/encode signals))
+        request (#erl cowboy_req/reply
+                  200
+                  #erl{"content-type" "application/json"}
+                  body
+                  request)]
+    #erl[:ok request state]))
+
+(defn- render-relay [value]
+  (str "<main id=\"app\"><output>" value "</output></main>"))
+
+(defn- subscribe-response [request]
+  (let [stream (starbeam/open! request)
+        owner (#erl erlang/self)]
+    (swap! subscribers conj owner)
+    (starbeam/patch-elements! stream (render-relay @relay-value))
+    #erl[:cowboy_loop
+         (starbeam/request stream)
+         {:kind :subscription :stream stream}]))
+
+(defn- command-response [request state]
+  (swap! relay-value inc)
+  (doseq [subscriber @subscribers]
+    (#erl erlang/send subscriber :refresh))
+  (let [request (#erl cowboy_req/reply 204 #erl{} "" request)]
+    #erl[:ok request state]))
+
+(defn- cookie-response [request state]
+  (let [request (#erl cowboy_req/reply 200 #erl{} "before" request)]
+    #erl[:ok request state]))
+
+(defn- rejected? [operation]
+  (try
+    (operation)
+    false
+    (catch _kind _reason
+      true)))
+
+(defn- lifecycle-response [request state]
+  (let [stream (starbeam/open! request)]
+    (starbeam/patch-elements! stream "<main id=\"lifecycle\">open</main>")
+    (#erl erlang/spawn
+      (fn []
+        (swap! lifecycle-results
+               assoc
+               :foreign-owner?
+               (rejected?
+                 #(starbeam/patch-elements!
+                    stream
+                    "<main>foreign</main>")))))
+    (eventually? #(contains? @lifecycle-results :foreign-owner?))
+    (starbeam/close! stream)
+    (swap! lifecycle-results
+           assoc
+           :closed?
+           (rejected?
+             #(starbeam/patch-elements! stream "<main>closed</main>"))
+           :double-close?
+           (rejected? #(starbeam/close! stream)))
+    #erl[:ok (starbeam/request stream) state]))
+
+(defn- limited-signals-response [request state]
+  (try
+    (let [[_signals request]
+          (starbeam/read-signals request #erl{:length 8})
+          request (#erl cowboy_req/reply 204 #erl{} "" request)]
+      #erl[:ok request state])
+    (catch _kind _reason
+      (let [request (#erl cowboy_req/reply 413 #erl{} "" request)]
+        #erl[:ok request state]))))
+
+(defn execute [request environment]
+  (let [session (some (fn [pair]
+                        (when (= "session" (nth pair 0))
+                          (nth pair 1)))
+                      (#erl cowboy_req/parse_cookies request))
+        request (#erl cowboy_req/set_resp_cookie
+                  "session"
+                  (or session "new")
+                  request
+                  #erl{:path "/" :http_only true :same_site :lax})]
+    #erl[:ok request environment]))
+
+(defn init [request state]
+  (case (#erl cowboy_req/path request)
+    "/" (stream-response request state)
+    "/signals" (signals-response request state)
+    "/limited-signals" (limited-signals-response request state)
+    "/lifecycle" (lifecycle-response request state)
+    "/subscribe" (subscribe-response request)
+    "/command" (command-response request state)
+    "/cookie" (cookie-response request state)))
+
+(defn info [message request state]
+  (if (and (= :subscription (:kind state))
+           (= :refresh message))
+    (let [stream (:stream state)]
+      (starbeam/patch-elements! stream (render-relay @relay-value))
+      (starbeam/close! stream)
+      (swap! subscribers disj (#erl erlang/self))
+      #erl[:stop (starbeam/request stream) state])
+    #erl[:ok request state]))
+
+(defn terminate [_reason _request state]
+  (when (= :subscription (:kind state))
+    (swap! subscribers disj (#erl erlang/self)))
+  nil)
+
+(defn- start-server! []
+  (#erl application/ensure_all_started :cowboy)
+  (#erl application/ensure_all_started :inets)
+  (reset! subscribers #{})
+  (reset! relay-value 0)
+  (reset! lifecycle-results {})
+  (let [handlers (#erl erlang/tuple_to_list
+                       #erl[#erl["/" :starbeam.core-test nil]
+                            #erl["/signals" :starbeam.core-test nil]
+                            #erl["/limited-signals" :starbeam.core-test nil]
+                            #erl["/lifecycle" :starbeam.core-test nil]
+                            #erl["/subscribe" :starbeam.core-test nil]
+                            #erl["/command" :starbeam.core-test nil]
+                            #erl["/cookie" :starbeam.core-test nil]])
+        routes (#erl erlang/tuple_to_list #erl[#erl[:_ handlers]])
+        dispatch (#erl cowboy_router/compile routes)
+        socket-options (#erl erlang/tuple_to_list #erl[#erl[:port 0]])
+        middlewares (#erl erlang/tuple_to_list
+                          #erl[:starbeam.core-test
+                               :cowboy_router
+                               :cowboy_handler])]
+    (#erl cowboy/start_clear
+      listener
+      #erl{:socket_opts socket-options}
+      #erl{:env #erl{:dispatch dispatch}
+           :middlewares middlewares})))
+
+(defn- stop-server! []
+  (#erl cowboy/stop_listener listener))
+
+(defn- request! [method request]
+  (#erl httpc/request method request empty-list binary-body-options))
+
+(defn- body-request! [method url body]
+  (request! method #erl[url empty-list json-content-type body]))
+
+(defn- response [result]
+  (is (= :ok (nth result 0)))
+  (nth result 1))
+
+(defn- eventually? [predicate]
+  (loop [attempts 500]
+    (cond
+      (predicate) true
+      (zero? attempts) false
+      :else (do
+              (#erl timer/sleep 10)
+              (recur (dec attempts))))))
+
+(defn- response-headers [response]
+  (reduce (fn [headers pair]
+            (assoc headers
+                   (#erl erlang/iolist_to_binary (nth pair 0))
+                   (#erl erlang/iolist_to_binary (nth pair 1))))
+          {}
+          (nth response 1)))
+
+(defn- element-event [html]
+  (str "event: datastar-patch-elements\n"
+       "data: elements " html "\n"
+       "\n"))
+
+(defn- relay-event [value]
+  (element-event
+    (str "<main id=\"app\"><output>" value "</output></main>")))
+
+(deftest cowboy-integration
+  (start-server!)
+  (try
+    (let [port (#erl ranch/get_port listener)
+          root-url (str "http://127.0.0.1:" port "/")
+          signals-base-url (str "http://127.0.0.1:" port "/signals")
+          get-url (str signals-base-url
+                       "?datastar=%7B%22count%22%3A2%7D")
+          delete-url (str signals-base-url
+                          "?datastar=%7B%22count%22%3A4%7D")
+          stream-response (response
+                            (request! :get #erl[root-url empty-list]))
+          status-line (nth stream-response 0)
+          headers (reduce (fn [headers pair]
+                            (assoc headers
+                                   (#erl erlang/iolist_to_binary (nth pair 0))
+                                   (#erl erlang/iolist_to_binary (nth pair 1))))
+                          {}
+                          (nth stream-response 1))
+          body (nth stream-response 2)
+          get-response (response
+                         (request! :get #erl[get-url empty-list]))
+          post-response (response
+                          (body-request! :post signals-base-url
+                                         "{\"count\":3}"))
+          delete-response (response
+                            (request! :delete #erl[delete-url empty-list]))
+          put-response (response
+                         (body-request! :put signals-base-url
+                                        "{\"count\":5}"))
+          patch-response (response
+                           (body-request! :patch signals-base-url
+                                          "{\"count\":6}"))]
+      (is (= 200 (nth status-line 1)))
+      (is (= "no-cache" (get headers "cache-control")))
+      (is (= "keep-alive" (get headers "connection")))
+      (is (= "text/event-stream" (get headers "content-type")))
+      (is (string/includes? (get headers "set-cookie") "session=new"))
+      (is (= expected-stream body))
+      (is (= "{\"count\":2}" (nth get-response 2)))
+      (is (= "{\"count\":3}" (nth post-response 2)))
+      (is (= "{\"count\":4}" (nth delete-response 2)))
+      (is (= "{\"count\":5}" (nth put-response 2)))
+      (is (= "{\"count\":6}" (nth patch-response 2))))
+    (finally
+      (stop-server!))))
+
+(deftest stream-lifecycle-and-input-limit
+  (start-server!)
+  (try
+    (let [port (#erl ranch/get_port listener)
+          lifecycle-url (str "http://127.0.0.1:" port "/lifecycle")
+          limited-url (str "http://127.0.0.1:" port "/limited-signals")
+          lifecycle (response
+                      (request! :get #erl[lifecycle-url empty-list]))
+          oversized (response
+                      (body-request!
+                        :post limited-url "{\"count\":7}"))]
+      (is (= (element-event "<main id=\"lifecycle\">open</main>")
+             (nth lifecycle 2)))
+      (is (eventually?
+            #(= #{:foreign-owner? :closed? :double-close?}
+                (set (keys @lifecycle-results)))))
+      (is (every? true? (vals @lifecycle-results)))
+      (is (= 413 (nth (nth oversized 0) 1))))
+    (finally
+      (stop-server!))))
+
+(deftest concurrent-relay-fat-morph
+  (start-server!)
+  (let [results (atom {})]
+    (try
+      (let [port (#erl ranch/get_port listener)
+            subscribe-url (str "http://127.0.0.1:" port "/subscribe")
+            command-url (str "http://127.0.0.1:" port "/command")]
+        (doseq [client [1 2]]
+          (#erl erlang/spawn
+            (fn []
+              (swap! results assoc client
+                     (request! :get #erl[subscribe-url empty-list])))))
+        (is (eventually? #(= 2 (count @subscribers))))
+        (let [command (response
+                        (body-request! :post command-url "{}"))]
+          (is (= 204 (nth (nth command 0) 1))))
+        (is (eventually? #(= 2 (count @results))))
+        (doseq [result (vals @results)]
+          (let [subscription (response result)]
+            (is (= 200 (nth (nth subscription 0) 1)))
+            (is (= (str (relay-event 0) (relay-event 1))
+                   (nth subscription 2))))))
+      (finally
+        (stop-server!)))))
+
+(deftest middleware-preserves-cookies
+  (start-server!)
+  (try
+    (let [port (#erl ranch/get_port listener)
+          url (str "http://127.0.0.1:" port "/cookie")
+          headers (#erl erlang/tuple_to_list
+                        #erl[#erl[(#erl erlang/binary_to_list "cookie")
+                                  (#erl erlang/binary_to_list
+                                    "session=customer-42")]])
+          result (response (request! :get #erl[url headers]))
+          response-headers (response-headers result)
+          set-cookie (get response-headers "set-cookie")]
+      (is (= "before" (nth result 2)))
+      (is (string/includes? set-cookie "session=customer-42"))
+      (is (string/includes? set-cookie "HttpOnly"))
+      (is (string/includes? set-cookie "SameSite=Lax")))
+    (finally
+      (stop-server!))))
+

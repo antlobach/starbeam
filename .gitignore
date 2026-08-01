@@ -1,0 +1,55 @@
+# Local task constraints
+/CONSTRAINTS.md
+
+# Rebar, Erlang, and Clojerl build artifacts
+/_build/
+/.rebar3/
+/.rebar/
+/_checkouts/
+/deps/
+/ebin/
+/.eunit/
+/_rel/
+*.beam
+*.ez
+erl_crash.dump
+crash.dump
+rebar3.crashdump
+*.plt
+
+# Test, coverage, and analysis caches
+/cover/
+*.coverdata
+/.clj-kondo/.cache/
+/.cpcache/
+/.lsp/
+/.nrepl-port
+
+# Local tools and scraped research
+/.firecrawl/
+/.direnv/
+/.envrc
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Logs and temporary files
+*.log
+*.pid
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+/.idea/
+/.vscode/
