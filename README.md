@@ -6,6 +6,13 @@
   Datastar SDK for Clojerl on the BEAM VM.
 </p>
 
+<p align="center">
+  <a href="https://github.com/antlobach/starbeam/actions/workflows/ci.yml"><img src="https://github.com/antlobach/starbeam/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="src/starbeam.app.src"><img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version 0.1.0"></a>
+  <img src="https://img.shields.io/badge/Erlang%2FOTP-27%20%7C%2028-purple" alt="Erlang/OTP 27 and 28">
+</p>
+
+
 ## Requirements
 
 | Component | Version |
@@ -13,6 +20,7 @@
 | Clojerl | 0.9.1 |
 | Erlang/OTP | 27 or 28 |
 | Cowboy | 2.13 |
+| Datastar | 1.0.2 |
 | rebar3 | newer than 3.14 |
 | rebar3_clojerl | 0.8.8 |
 
@@ -191,6 +199,31 @@ HTTP/1.1 responses also receive `Connection: keep-alive`.
 `request` returns the Cowboy request containing the streaming response state. Return that request from the handler. `close!` sends the final body marker. Keep long-lived subscriptions open until their owner process finishes.
 
 Only the BEAM process that called `open!` may write to its stream. Other processes should send refresh notifications to the owner process instead of calling `patch-elements!` themselves. This rule keeps event ordering deterministic without locks.
+
+### Observe client disconnects
+
+Cowboy calls `terminate/3` once for each `/time` loop handler when its request process stops. Log the handler PID and direct TCP peer to distinguish clients:
+
+```clojure
+(defn terminate [reason request _state]
+  (let [handler-pid (#erl erlang/self)
+        peer (#erl cowboy_req/peer request)]
+    (#erl io/format
+          "Clock client pid=~p peer=~p terminated reason=~p~n"
+          (clj_rt/to_list.1 [handler-pid peer reason])))
+  nil)
+```
+
+Open two streams in separate terminals:
+
+```shell
+curl --no-buffer http://127.0.0.1:8080/time
+```
+
+Stop one client with `Ctrl-C`. Its PID and peer appear in the REPL while the other stream continues. A reconnect creates a new handler PID and usually a new source port. Behind a reverse proxy, `cowboy_req/peer` identifies the proxy rather than the browser.
+
+Re-evaluating `terminate` replaces the handler code directly; it does not require `apply-routes!`.
+
 
 ## Patch elements
 
