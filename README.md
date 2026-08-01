@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/starbeam-logo.png?v=2" alt="Starbeam symbol" width="240">
+  <img src="assets/starbeam-logo.png?v=3" alt="Starbeam symbol" width="240">
 </p>
 
 <p align="center">
@@ -12,7 +12,6 @@
   <img src="https://img.shields.io/badge/Erlang%2FOTP-27%20%7C%2028-purple" alt="Erlang/OTP 27 and 28">
 </p>
 
-
 ## Requirements
 
 | Component | Version |
@@ -24,7 +23,7 @@
 | rebar3 | newer than 3.14 |
 | rebar3_clojerl | 0.8.8 |
 
-Starbeam pins Clojerl 0.9.1, the [latest Clojerl release](https://github.com/antlobach/clojerl/releases/latest) at the time of writing. Clojerl 0.9.1 supports Erlang/OTP 24 through 28; Starbeam targets OTP 27 and 28 because it uses OTP's built-in `json` module.
+Starbeam pins Clojerl 0.9.1 and supports Erlang/OTP 27 and 28. OTP's built-in `json` module supplies JSON encoding and decoding.
 
 ## Get Clojerl
 
@@ -39,7 +38,7 @@ make
 make repl
 ```
 
-Clojerl requires `rebar3`. The project README tracks current platform notes and Windows commands.
+See the [Clojerl README](https://github.com/clojerl/clojerl) for platform-specific setup.
 
 ## Add Starbeam to a Clojerl project
 
@@ -51,13 +50,11 @@ Add Clojerl, Cowboy, and Starbeam to `rebar.config`:
    {git, "https://github.com/antlobach/clojerl.git", {tag, "0.9.1"}}},
   {cowboy, "2.13.0"},
   {starbeam,
-   {git, "git@github.com:antlobach/starbeam.git", {branch, "main"}}}]}.
+   {git, "https://github.com/antlobach/starbeam.git", {branch, "main"}}}]}.
 
 {plugins,
  [{rebar3_clojerl, "0.8.8"}]}.
 ```
-
-The Starbeam repository is private. The SSH dependency requires GitHub access to `antlobach/starbeam`.
 
 Compile the project:
 
@@ -96,9 +93,9 @@ Load Starbeam:
 (require '[starbeam.core :as starbeam])
 ```
 
-Handlers are ordinary Clojerl namespaces. Re-evaluate a `defn` in the running REPL and subsequent Cowboy requests use the replacement; Starbeam adds no indirection or lifecycle machinery.
+Cowboy calls handler functions directly from Clojerl namespaces. Re-evaluate a `defn` in the running REPL to replace it for subsequent requests.
 
-Useful project commands:
+Project commands:
 
 ```shell
 rebar3 clojerl compile
@@ -123,7 +120,7 @@ Create `src/demo/events.clje`:
     #erl[:ok (starbeam/request stream) state]))
 ```
 
-Compile, then start the REPL:
+Compile and start the REPL:
 
 ```shell
 rebar3 clojerl compile
@@ -154,7 +151,7 @@ Inspect the stream:
 curl -N http://127.0.0.1:8080/events
 ```
 
-The response contains one Datastar event:
+Expected event:
 
 ```text
 event: datastar-patch-elements
@@ -168,7 +165,7 @@ Stop the listener from the REPL:
 (#erl cowboy/stop_listener :starbeam-demo)
 ```
 
-A Datastar page can open the endpoint on load:
+Open the endpoint from Datastar:
 
 ```html
 <body data-init="@get('/events')">
@@ -178,7 +175,7 @@ A Datastar page can open the endpoint on load:
 
 ## Stream lifecycle
 
-A Cowboy handler uses four steps:
+Handler sequence:
 
 ```clojure
 (let [stream (starbeam/open! request)]
@@ -196,13 +193,13 @@ Content-Type: text/event-stream
 
 HTTP/1.1 responses also receive `Connection: keep-alive`.
 
-`request` returns the Cowboy request containing the streaming response state. Return that request from the handler. `close!` sends the final body marker. Keep long-lived subscriptions open until their owner process finishes.
+`request` returns the updated Cowboy request; return it from the handler. `close!` sends the final body marker. Leave long-lived subscriptions open until their owner process exits.
 
-Only the BEAM process that called `open!` may write to its stream. Other processes should send refresh notifications to the owner process instead of calling `patch-elements!` themselves. This rule keeps event ordering deterministic without locks.
+Only the process that called `open!` may write to the stream. Other processes notify the owner with BEAM messages. Process ownership preserves event order without locks.
 
 ### Observe client disconnects
 
-Cowboy calls `terminate/3` once for each `/time` loop handler when its request process stops. Log the handler PID and direct TCP peer to distinguish clients:
+Cowboy calls `terminate/3` when each `/time` loop handler stops. Log the handler PID and direct TCP peer to identify the request:
 
 ```clojure
 (defn terminate [reason request _state]
@@ -214,16 +211,15 @@ Cowboy calls `terminate/3` once for each `/time` loop handler when its request p
   nil)
 ```
 
-Open two streams in separate terminals:
+Run two clients:
 
 ```shell
 curl --no-buffer http://127.0.0.1:8080/time
 ```
 
-Stop one client with `Ctrl-C`. Its PID and peer appear in the REPL while the other stream continues. A reconnect creates a new handler PID and usually a new source port. Behind a reverse proxy, `cowboy_req/peer` identifies the proxy rather than the browser.
+Stop one client with `Ctrl-C`. Its PID and peer appear in the REPL; the other stream remains open. Reconnection creates a new handler PID and usually a new source port. Behind a reverse proxy, `cowboy_req/peer` identifies the proxy.
 
-Re-evaluating `terminate` replaces the handler code directly; it does not require `apply-routes!`.
-
+Re-evaluate `terminate` directly. Route dispatch remains unchanged, so `apply-routes!` is unnecessary.
 
 ## Patch elements
 
@@ -283,7 +279,7 @@ Send an RFC 7386 JSON Merge Patch using pre-encoded JSON:
   "{\"ready\":true,\"count\":4}")
 ```
 
-You can also pass an Erlang JSON term. OTP's `json` module encodes it:
+OTP's `json` module encodes Erlang JSON terms:
 
 ```clojure
 (starbeam/patch-signals!
@@ -303,7 +299,7 @@ Set missing signals without replacing existing values:
    :retry-duration 2000})
 ```
 
-Pre-encoded JSON passes through without key conversion. Native decoded and encoded values remain Erlang terms, avoiding a second copy of the object graph.
+Pre-encoded JSON passes through unchanged. Decoded and encoded values remain Erlang terms, avoiding another copy of the object graph.
 
 ## Execute a script
 
@@ -332,7 +328,7 @@ Add attributes or keep the script element after execution:
 
 ## Read Datastar signals
 
-`read-signals` follows the Datastar SDK request contract:
+`read-signals` uses the Datastar SDK request contract:
 
 | Method | Signal location |
 | --- | --- |
@@ -342,7 +338,7 @@ Add attributes or keep the script element after execution:
 | `PUT` | JSON request body |
 | `PATCH` | JSON request body |
 
-A command handler can decode the signals and return `204`:
+Decode signals and return `204`:
 
 ```clojure
 (ns demo.command
@@ -358,13 +354,13 @@ A command handler can decode the signals and return `204`:
     #erl[:ok request state]))
 ```
 
-`read-signals` returns `[signals updated-request]`. Always use the returned request after reading a body. Cowboy requests are immutable, and chunked body reads produce a new request value.
+`read-signals` returns `[signals updated-request]`. Use the returned request after reading a body because Cowboy request values are immutable.
 
-Decoded JSON stays in Erlang-native form: maps with binary keys, lists, binaries, numbers, booleans, and the JSON null atom. Missing signal data, malformed JSON, unsupported methods, and body-read failures raise descriptive exceptions.
+Decoded JSON uses Erlang maps with binary keys, lists, binaries, numbers, booleans, and the JSON null atom. Missing signal data, malformed JSON, unsupported methods, and body-read failures raise exceptions.
 
 ## Long-lived CQRS stream
 
-Starbeam supports command/query separation without owning the architecture:
+Keep commands and long-lived queries separate at the application layer:
 
 ```clojure
 (ns demo.subscription
@@ -400,7 +396,7 @@ Each subscription process should:
 4. Wait for a refresh notification.
 5. Repeat from authoritative state.
 
-The notification means that state may have changed. It does not carry an HTML delta. A reconnect renders the latest state immediately, so this design does not require event replay.
+A notification means state may have changed; it carries no HTML delta. Reconnection renders current state and needs no event replay.
 
 ## API
 
@@ -421,7 +417,7 @@ The notification means that state may have changed. It does not carry an HTML de
 (starbeam/close! stream)
 ```
 
-Event operations return `:ok` or propagate an Erlang/Clojerl error. Starbeam builds each event as iodata and sends it with one Cowboy `stream_body` call.
+Event operations return `:ok` or propagate the underlying error. Each operation builds one iodata frame and sends one Cowboy `stream_body` message.
 
 ## Scope
 
@@ -434,7 +430,7 @@ Starbeam provides:
 - Script execution events
 - Datastar signal decoding
 
-Applications provide routing, HTML rendering, databases, authentication, supervision, pub/sub, compression, and browser assets.
+Applications own routing, rendering, persistence, authentication, supervision, pub/sub, compression, and browser assets.
 
 ## Development
 
@@ -449,9 +445,9 @@ Build the optional Cowboy HTTP/3 profile:
 rebar3 as http3 compile
 ```
 
-This profile adds Quicer and compiles Cowboy's QUIC adapter. Starbeam handlers use the same API over HTTP/1.1, HTTP/2, and HTTP/3; listener and certificate setup remain application concerns.
+The HTTP/3 profile adds Quicer and Cowboy's QUIC adapter. Starbeam uses the same handler API across HTTP/1.1, HTTP/2, and HTTP/3.
 
-The integration test starts a real Cowboy listener and checks exact SSE bytes, response headers, and signal decoding for `GET`, `DELETE`, `POST`, `PUT`, and `PATCH`.
+Integration tests start Cowboy and cover exact SSE frames, response headers, signal decoding for every supported method, stream ownership and closure, payload limits, concurrent subscribers, and middleware cookies.
 
 ## References
 
