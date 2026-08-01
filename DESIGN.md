@@ -1,6 +1,6 @@
 # Starbeam Design
 
-![Starbeam](assets/starbeam-logo.png?v=3)
+![Starbeam](assets/starbeam-logo-v4.png)
 
 Starbeam reads Datastar signals from Cowboy requests and writes Datastar events to Cowboy streaming responses.
 

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/starbeam-logo.png?v=3" alt="Starbeam symbol" width="240">
+  <img src="assets/starbeam-logo-v4.png" alt="Starbeam symbol" width="240">
 </p>
 
 <p align="center">
