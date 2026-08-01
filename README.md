@@ -9,6 +9,7 @@
 <p align="center">
   <a href="https://github.com/antlobach/starbeam/actions/workflows/ci.yml"><img src="https://github.com/antlobach/starbeam/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="src/starbeam.app.src"><img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version 0.1.0"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
   <img src="https://img.shields.io/badge/Erlang%2FOTP-27%20%7C%2028-purple" alt="Erlang/OTP 27 and 28">
 </p>
 
